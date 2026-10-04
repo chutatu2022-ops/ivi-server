@@ -8,19 +8,16 @@ import threading
 
 app = Flask(__name__)
 
-# Считывание ключа из настроек сервера (Render Environment Variables)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-STT_MODEL = "gpt-4o-transcribe"
-GPT_MODEL = "gpt-5-mini"
-TTS_MODEL = "gpt-4o-mini-tts"
+STT_MODEL = "whisper-1"
+GPT_MODEL = "gpt-4o-mini"
+TTS_MODEL = "tts-1"
 
 active_reminders = []
 
 def on_reminder_triggered(reminder_text):
-    print(f"[ТАЙМЕР СПРАЦЮВАВ] Нагадування: '{reminder_text}'")
     active_reminders.append(reminder_text)
 
 def schedule_reminder(seconds, text):
@@ -38,55 +35,30 @@ def pop_due_reminders():
 
 REMINDER_TOOL = {
     "type": "function",
-    "name": "set_reminder",
-    "description": "Встановлює нагадування для користувача через вказану кількість секунд",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "seconds": {"type": "integer", "description": "Кількість секунд"},
-            "text": {"type": "string", "description": "Текст завдання"}
-        },
-        "required": ["seconds", "text"]
+    "function": {
+        "name": "set_reminder",
+        "description": "Встановлює нагадування для користувача через вказану кількість секунд",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "seconds": {"type": "integer", "description": "Кількість секунд"},
+                "text": {"type": "string", "description": "Текст завдання"}
+            },
+            "required": ["seconds", "text"]
+        }
     }
 }
 
-HISTORY_FILE = "history.json"
+conversation = []
 MAX_MESSAGES = 20
-
-def load_history():
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    return data
-        except Exception:
-            pass
-    return []
-
-def save_history(history):
-    try:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-def clear_history():
-    global conversation
-    conversation = []
-    save_history(conversation)
-
-conversation = load_history()
 
 SYSTEM_PROMPT = """
 Ти — кишеньковий голосовий помічник на ім'я Іві.
 Спілкуйся виключно українською мовою.
-
 Твої відповіді озвучуються вголос через динамік робота:
-- Відповідай лаконічно, коротко і зрозуміло (1-2 речення).
-- Якщо просять щось нагадати — викликай set_reminder.
+- Відповідай лаконічно (1-2 речення).
+- Якщо просять нагадати щось — викликай функцію set_reminder.
 - Не використовуй списки, markdown, лапки чи зірочки.
-- Будь живою, дотепною та дружньою.
 """
 
 HALLUCINATIONS = [
@@ -100,7 +72,7 @@ def text_to_speech(text):
     print("TTS:", clean)
     response = client.audio.speech.create(
         model=TTS_MODEL,
-        voice="shimmer",
+        voice="nova",
         input=clean,
         response_format="wav"
     )
@@ -110,7 +82,12 @@ def speech_to_text(audio_bytes):
     try:
         f = io.BytesIO(audio_bytes)
         f.name = "audio.wav"
-        res = client.audio.transcriptions.create(model=STT_MODEL, file=f, language="uk")
+        res = client.audio.transcriptions.create(
+            model=STT_MODEL,
+            file=f,
+            language="uk",
+            prompt="Іві, привіт."
+        )
         text = res.text.strip()
         print("STT:", repr(text))
         return text
@@ -140,7 +117,7 @@ def is_garbage(text):
 
 def is_wake(text):
     norm = normalize_text(text)
-    return any(v in norm for v in ["іві", "иві", "иви", "іва", "evi", "ivi"])
+    return any(v in norm for v in ["іві", "иві", "иви", "іва", "evi", "ivi", "привіт"])
 
 def ask_gpt(user_text):
     global conversation
@@ -148,29 +125,32 @@ def ask_gpt(user_text):
     if len(conversation) > MAX_MESSAGES:
         conversation = conversation[-MAX_MESSAGES:]
 
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversation
+
     try:
-        response = client.responses.create(
+        response = client.chat.completions.create(
             model=GPT_MODEL,
-            instructions=SYSTEM_PROMPT,
-            input=conversation,
-            tools=[{"type": "web_search_preview"}, REMINDER_TOOL]
+            messages=messages,
+            tools=[REMINDER_TOOL],
+            tool_choice="auto"
         )
 
+        choice = response.choices[0].message
         reminder_msg = ""
-        for item in getattr(response, "output", []):
-            if getattr(item, "type", "") == "function_call":
-                if getattr(item, "name", "") == "set_reminder":
-                    args = json.loads(item.arguments)
+
+        if choice.tool_calls:
+            for call in choice.tool_calls:
+                if call.function.name == "set_reminder":
+                    args = json.loads(call.function.arguments)
                     sec = int(args.get("seconds", 60))
                     reminder_msg = str(args.get("text", "Нагадування"))
                     schedule_reminder(sec, reminder_msg)
 
-        answer = (response.output_text or "").strip()
+        answer = (choice.content or "").strip()
         if not answer:
-            answer = f"Добре, я нагадаю вам: {reminder_msg}." if reminder_msg else "Я вас слухаю."
+            answer = f"Добре, я нагадаю: {reminder_msg}." if reminder_msg else "Я вас слухаю."
 
         conversation.append({"role": "assistant", "content": answer})
-        save_history(conversation)
         return answer
     except Exception as e:
         print("GPT ERROR:", e)
@@ -219,7 +199,7 @@ def upload():
         return resp
 
     if is_clear_memory(text):
-        clear_history()
+        conversation.clear()
         audio_resp = text_to_speech("Пам'ять очищено. Почнімо спочатку.")
         resp = Response(audio_resp, status=200, mimetype="audio/wav")
         resp.headers["X-Sleep"] = "0"
