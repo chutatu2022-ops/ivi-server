@@ -18,6 +18,7 @@ TTS_MODEL = "tts-1"
 active_reminders = []
 
 def on_reminder_triggered(reminder_text):
+    print(f"[TIMER] Triggered: '{reminder_text}'")
     active_reminders.append(reminder_text)
 
 def schedule_reminder(seconds, text):
@@ -69,14 +70,20 @@ HALLUCINATIONS = [
 
 def text_to_speech(text):
     clean = (text or "").strip() or "Слухаю вас."
-    print("TTS:", clean)
-    response = client.audio.speech.create(
-        model=TTS_MODEL,
-        voice="nova",
-        input=clean,
-        response_format="wav"
-    )
-    return response.content
+    print("TTS input:", repr(clean))
+    try:
+        response = client.audio.speech.create(
+            model=TTS_MODEL,
+            voice="nova",
+            input=clean,
+            response_format="wav"
+        )
+        audio_data = response.content
+        print(f"TTS generated: {len(audio_data)} bytes")
+        return audio_data
+    except Exception as e:
+        print("TTS ERROR:", e)
+        return b""
 
 def speech_to_text(audio_bytes):
     try:
@@ -89,7 +96,7 @@ def speech_to_text(audio_bytes):
             prompt="Іві, привіт."
         )
         text = res.text.strip()
-        print("STT:", repr(text))
+        print("STT result:", repr(text))
         return text
     except Exception as e:
         print("STT ERROR:", e)
@@ -117,7 +124,7 @@ def is_garbage(text):
 
 def is_wake(text):
     norm = normalize_text(text)
-    return any(v in norm for v in ["іві", "иві", "иви", "іва", "evi", "ivi", "привіт"])
+    return any(v in norm for v in ["іві", "иві", "иви", "іва", "evi", "ivi", "привіт", "слухай"])
 
 def ask_gpt(user_text):
     global conversation
@@ -166,7 +173,10 @@ def check_reminders():
     if not due:
         return Response("", status=204)
     audio = text_to_speech(due)
+    if not audio:
+        return Response("", status=500)
     resp = Response(audio, status=200, mimetype="audio/wav")
+    resp.headers["Content-Length"] = str(len(audio))
     resp.headers["X-Alarm"] = "1"
     return resp
 
@@ -175,6 +185,7 @@ def wake():
     audio = request.data
     if not audio:
         return Response("NO_AUDIO", status=400)
+    
     text = speech_to_text(audio)
     if not text or not is_wake(text):
         return Response("", status=204)
@@ -182,7 +193,12 @@ def wake():
     due = pop_due_reminders()
     msg = f"{due} Я слухаю, хазяїн." if due else "Я слухаю, хазяїн."
     audio_resp = text_to_speech(msg.strip())
+    
+    if not audio_resp:
+        return Response("", status=500)
+
     resp = Response(audio_resp, status=200, mimetype="audio/wav")
+    resp.headers["Content-Length"] = str(len(audio_resp))
     resp.headers["X-Sleep"] = "0"
     return resp
 
@@ -202,12 +218,14 @@ def upload():
         conversation.clear()
         audio_resp = text_to_speech("Пам'ять очищено. Почнімо спочатку.")
         resp = Response(audio_resp, status=200, mimetype="audio/wav")
+        resp.headers["Content-Length"] = str(len(audio_resp))
         resp.headers["X-Sleep"] = "0"
         return resp
 
     if is_sleep(text):
         audio_resp = text_to_speech("Переходжу в режим очікування.")
         resp = Response(audio_resp, status=200, mimetype="audio/wav")
+        resp.headers["Content-Length"] = str(len(audio_resp))
         resp.headers["X-Sleep"] = "1"
         return resp
 
@@ -221,7 +239,11 @@ def upload():
     full = (due + " " + answer).strip()
 
     audio_resp = text_to_speech(full)
+    if not audio_resp:
+        return Response("", status=500)
+
     resp = Response(audio_resp, status=200, mimetype="audio/wav")
+    resp.headers["Content-Length"] = str(len(audio_resp))
     resp.headers["X-Sleep"] = "0"
     return resp
 
